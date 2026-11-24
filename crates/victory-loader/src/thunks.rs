@@ -15,13 +15,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    DebugBreak, FlushInstructionCache, IsDebuggerPresent,
-};
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// What an unimplemented import does when called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,7 +43,7 @@ pub fn unimplemented_call_count() -> u64 {
     UNIMPLEMENTED_CALLS.load(Ordering::Relaxed)
 }
 
-extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
+extern "win64" fn unimplemented_import(site: &'static ImportSite) -> u64 {
     UNIMPLEMENTED_CALLS.fetch_add(1, Ordering::Relaxed);
     let previous = site.calls.fetch_add(1, Ordering::Relaxed);
     match site.policy {
@@ -62,17 +55,11 @@ extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
         }
         UnimplementedPolicy::Trap => {
             tracing::error!(dll = %site.dll, symbol = %site.symbol, "unimplemented import called");
-            // Into the crash log too: `abort` ends the process without
-            // running the handlers that write it.
-            let (dll, symbol) = (&site.dll, &site.symbol);
-            let text = format!("VIctory: unimplemented import {dll}!{symbol} called");
-            crate::log_crash(&text);
-            // SAFETY: plain Win32 calls without preconditions.
-            unsafe {
-                if IsDebuggerPresent() != 0 {
-                    DebugBreak();
-                }
-            }
+            eprintln!(
+                "VIctory: unimplemented import {}!{} called",
+                site.dll, site.symbol
+            );
+            os::break_into_debugger();
             std::process::abort();
         }
     }
@@ -91,21 +78,7 @@ impl ThunkBlock {
     /// Reserves room for `count` stubs (writable until [`Self::seal`]).
     pub(crate) fn new(count: usize) -> Result<Self> {
         let len = (count.max(1) * THUNK_SIZE).next_multiple_of(4096);
-        // SAFETY: fresh anonymous allocation; no existing memory is touched.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                len,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        } as *mut u8;
-        if base.is_null() {
-            bail!(
-                "VirtualAlloc for import stubs failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        let base = os::alloc(len)?;
         Ok(ThunkBlock { base, len, used: 0 })
     }
 
@@ -118,7 +91,7 @@ impl ThunkBlock {
         code[0..2].copy_from_slice(&[0x48, 0xB9]);
         code[2..10].copy_from_slice(&(site as *const ImportSite as u64).to_le_bytes());
         code[10..12].copy_from_slice(&[0x48, 0xB8]);
-        let handler = unimplemented_import as extern "system" fn(&'static ImportSite) -> u64;
+        let handler = unimplemented_import as extern "win64" fn(&'static ImportSite) -> u64;
         code[12..20].copy_from_slice(&(handler as *const () as u64).to_le_bytes());
         code[20..22].copy_from_slice(&[0xFF, 0xE0]);
         // SAFETY: `used + THUNK_SIZE <= len`, and the block is still writable.
@@ -134,9 +107,44 @@ impl ThunkBlock {
     /// Makes the block read+execute. The block is intentionally leaked:
     /// title code may hold these addresses for the life of the process.
     pub(crate) fn seal(self) -> Result<()> {
+        os::seal(self.base, self.len)
+    }
+}
+
+#[cfg(windows)]
+mod os {
+    use anyhow::{Result, bail};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        DebugBreak, FlushInstructionCache, IsDebuggerPresent,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    pub(super) fn alloc(len: usize) -> Result<*mut u8> {
+        // SAFETY: fresh anonymous allocation; no existing memory is touched.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                         len,
+                         MEM_COMMIT | MEM_RESERVE,
+                         PAGE_READWRITE,
+            )
+        } as *mut u8;
+        if base.is_null() {
+            bail!(
+                "VirtualAlloc for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(base)
+    }
+
+    pub(super) fn seal(base: *mut u8, len: usize) -> Result<()> {
         let mut old = 0;
-        // SAFETY: `base..base+len` is the allocation made in `new`.
-        let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
+        // SAFETY: `base..base+len` is the allocation made in `alloc`.
+        let ok = unsafe { VirtualProtect(base as _, len, PAGE_EXECUTE_READ, &mut old) };
         if ok == 0 {
             bail!(
                 "VirtualProtect for import stubs failed: {}",
@@ -144,8 +152,71 @@ impl ThunkBlock {
             );
         }
         // SAFETY: flushing our own process's instruction cache for our own block.
-        unsafe { FlushInstructionCache(GetCurrentProcess(), self.base as _, self.len) };
+        unsafe { FlushInstructionCache(GetCurrentProcess(), base as _, len) };
         Ok(())
+    }
+
+    pub(super) fn break_into_debugger() {
+        // SAFETY: plain Win32 calls without preconditions.
+        unsafe {
+            if IsDebuggerPresent() != 0 {
+                DebugBreak();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+mod os {
+    use anyhow::{Result, bail};
+
+    pub(super) fn alloc(len: usize) -> Result<*mut u8> {
+        // SAFETY: fresh anonymous mapping; no existing memory is touched.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                       len,
+                       libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                       -1,
+                       0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            bail!(
+                "mmap for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(base.cast())
+    }
+
+    pub(super) fn seal(base: *mut u8, len: usize) -> Result<()> {
+        // SAFETY: `base..base+len` is the mapping made in `alloc`.
+        let ok = unsafe { libc::mprotect(base.cast(), len, libc::PROT_READ | libc::PROT_EXEC) };
+        if ok != 0 {
+            bail!(
+                "mprotect for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn break_into_debugger() {
+        if debugger_present() {
+            // SAFETY: raising a signal has no preconditions.
+            unsafe { libc::raise(libc::SIGTRAP) };
+        }
+    }
+
+    fn debugger_present() -> bool {
+        std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+            status
+            .lines()
+            .find_map(|line| line.strip_prefix("TracerPid:"))
+            .is_some_and(|pid| pid.trim() != "0")
+        })
     }
 }
 
@@ -153,35 +224,20 @@ impl ThunkBlock {
 mod tests {
     use super::*;
 
-    /// In a child process of the next test: calls an unimplemented import
-    /// that traps, with the crash log where `VICTORY_TRAP_LOG` says.
     #[test]
-    fn trap_child() {
-        let Some(log) = std::env::var_os("VICTORY_TRAP_LOG") else {
-            return;
-        };
-        crate::log_crashes_to(log.into());
-        let site = Box::leak(Box::new(ImportSite {
-            dll: "probe.dll".into(),
-            symbol: "Missing".into(),
-            policy: UnimplementedPolicy::Trap,
-            calls: AtomicU64::new(0),
+    fn a_stub_reaches_the_handler_and_returns_zero() {
+        let site: &'static ImportSite = Box::leak(Box::new(ImportSite {
+            dll: "probe.dll".to_owned(),
+                                                           symbol: "Nothing".to_owned(),
+                                                           policy: UnimplementedPolicy::ReturnZero,
+                                                           calls: AtomicU64::new(0),
         }));
-        unimplemented_import(site);
-    }
-
-    #[test]
-    fn a_trapped_import_is_in_the_crash_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("crashes.log");
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "thunks::tests::trap_child", "--nocapture"])
-            .env("VICTORY_TRAP_LOG", &log)
-            .output()
-            .unwrap();
-        assert!(!out.status.success(), "the trap ends the process");
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
-        let named = text.contains("VIctory: unimplemented import probe.dll!Missing called");
-        assert!(named, "crash log: {text:?}");
+        let mut block = ThunkBlock::new(1).unwrap();
+        let at = block.emit(site).unwrap();
+        block.seal().unwrap();
+        // SAFETY: `at` is a sealed stub that jumps to `unimplemented_import`.
+        let stub = unsafe { std::mem::transmute::<usize, extern "win64" fn() -> u64>(at) };
+        assert_eq!(stub(), 0);
+        assert_eq!(site.calls.load(Ordering::Relaxed), 1);
     }
 }

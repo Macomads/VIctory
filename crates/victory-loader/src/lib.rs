@@ -29,7 +29,7 @@ pub mod resolve;
 mod stacks;
 #[cfg(windows)]
 mod threads;
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod thunks;
 #[cfg(windows)]
 mod tls;
@@ -48,7 +48,7 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
 pub use windows::{
