@@ -13,6 +13,8 @@ mod bind;
 
 pub use bind::{BindReport, MissingImport};
 mod teb;
+#[cfg(test)]
+mod title;
 pub use teb::ThreadEnv;
 
 #[derive(Debug)]
