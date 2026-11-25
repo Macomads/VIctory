@@ -58,7 +58,7 @@ pub use windows::{
 };
 
 #[cfg(target_os = "linux")]
-pub use linux::{MappedImage, map_image};
+pub use linux::{MappedImage, map_image, map_image_at};
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;
