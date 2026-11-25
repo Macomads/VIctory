@@ -35,6 +35,8 @@ mod thunks;
 mod tls;
 #[cfg(windows)]
 mod windows;
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(windows)]
 pub use crash::{
@@ -54,6 +56,9 @@ pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 pub use windows::{
     BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
 };
+
+#[cfg(target_os = "linux")]
+pub use linux::{MappedImage, map_image};
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;
