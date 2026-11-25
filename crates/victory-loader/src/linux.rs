@@ -9,6 +9,10 @@ const SCN_MEM_WRITE: u32 = 0x8000_0000;
 const REL_ABSOLUTE: u16 = 0;
 const REL_DIR64: u16 = 10;
 
+mod bind;
+
+pub use bind::{BindReport, MissingImport};
+
 #[derive(Debug)]
 pub struct MappedImage {
     base: usize,
