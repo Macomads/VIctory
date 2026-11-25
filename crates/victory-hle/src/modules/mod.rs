@@ -24,6 +24,8 @@ pub mod kernel;
 pub mod libm;
 #[cfg(not(windows))]
 pub mod crt;
+#[cfg(not(windows))]
+pub mod convert;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
@@ -78,5 +80,7 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(libm::module());
     #[cfg(not(windows))]
     all.push(crt::module());
+    #[cfg(not(windows))]
+    all.push(convert::module());
     all
 }
