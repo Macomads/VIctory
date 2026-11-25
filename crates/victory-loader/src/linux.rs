@@ -12,6 +12,8 @@ const REL_DIR64: u16 = 10;
 mod bind;
 
 pub use bind::{BindReport, MissingImport};
+mod teb;
+pub use teb::ThreadEnv;
 
 #[derive(Debug)]
 pub struct MappedImage {
