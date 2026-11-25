@@ -22,3 +22,19 @@ fn the_title_executable_maps_with_its_tls() {
     );
     ThreadEnv::new(Some(&image)).unwrap();
 }
+
+#[test]
+#[ignore = "needs VICTORY_TITLE_EXE, the title's executable"]
+fn the_title_imports_by_dll() {
+    let path = std::env::var("VICTORY_TITLE_EXE").expect("VICTORY_TITLE_EXE is not set");
+    let info = victory_pe::ImageInfo::parse(&std::fs::read(path).unwrap()).unwrap();
+    let mut modules: Vec<_> = info
+        .imports
+        .iter()
+        .map(|module| (module.entries.len(), module.dll.to_ascii_lowercase()))
+        .collect();
+    modules.sort_by(|a, b| b.0.cmp(&a.0));
+    for (count, dll) in modules {
+        println!("{count:5} {dll}");
+    }
+}
