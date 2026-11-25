@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -152,7 +153,17 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+        } => {
+            #[cfg(windows)]
+            {
+                translate::run(paths, validate, pipelines, list, jobs)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (paths, validate, pipelines, list, jobs);
+                anyhow::bail!("translate requires Windows")
+            }
+        }
         Command::Run {
             exe,
             unimplemented,
