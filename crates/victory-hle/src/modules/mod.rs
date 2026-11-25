@@ -22,6 +22,8 @@ pub mod gameinput;
 pub mod kernel;
 #[cfg(not(windows))]
 pub mod libm;
+#[cfg(not(windows))]
+pub mod crt;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
@@ -74,5 +76,7 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xsystem::module());
     #[cfg(not(windows))]
     all.push(libm::module());
+    #[cfg(not(windows))]
+    all.push(crt::module());
     all
 }
