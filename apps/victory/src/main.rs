@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -172,9 +173,27 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            #[cfg(windows)]
+            {
+                translate::run(paths, validate, pipelines, list, jobs)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (paths, validate, pipelines, list, jobs);
+                anyhow::bail!("translate requires Windows")
+            }
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Warm { paths, jobs, no_pipelines } => {
+            #[cfg(windows)]
+            {
+                translate::warm(paths, jobs, !no_pipelines)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (paths, jobs, no_pipelines);
+                anyhow::bail!("warm requires Windows")
+            }
+        }
         Command::Run {
             exe,
             unimplemented,

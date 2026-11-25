@@ -20,6 +20,14 @@ pub mod dstorage;
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
+#[cfg(not(windows))]
+pub mod libm;
+#[cfg(not(windows))]
+pub mod crt;
+#[cfg(not(windows))]
+pub mod convert;
+#[cfg(not(windows))]
+pub mod crt_runtime;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
@@ -70,5 +78,13 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(not(windows))]
+    all.push(libm::module());
+    #[cfg(not(windows))]
+    all.push(crt::module());
+    #[cfg(not(windows))]
+    all.push(convert::module());
+    #[cfg(not(windows))]
+    all.push(crt_runtime::module());
     all
 }
