@@ -398,7 +398,7 @@ impl LoadedImage {
         // Xbox games need larger stacks; PE header often specifies only 1MB
         let stack = usize::try_from(self.info.stack_reserve)
             .unwrap_or(usize::MAX)
-            .max(64 << 20);  // 64 MB minimum for Xbox titles
+            .max(256 << 20);  // 256 MB minimum for Xbox titles
         std::thread::Builder::new()
             .name("title-main".into())
             .stack_size(stack)
