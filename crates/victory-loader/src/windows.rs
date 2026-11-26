@@ -395,9 +395,10 @@ impl LoadedImage {
         if self.info.entry_rva == 0 {
             bail!("image has no entry point");
         }
+        // Xbox games need larger stacks; PE header often specifies only 1MB
         let stack = usize::try_from(self.info.stack_reserve)
             .unwrap_or(usize::MAX)
-            .max(1 << 20);
+            .max(8 << 20);  // 8 MB minimum for Xbox titles
         std::thread::Builder::new()
             .name("title-main".into())
             .stack_size(stack)
