@@ -205,6 +205,13 @@ impl ImageInfo {
         has_flag(self.characteristics, layout::file_flags::DLL)
     }
 
+    /// Returns true if the image has a section named `.reloc` (case-insensitive).
+    pub fn has_reloc_section(&self) -> bool {
+        self.sections
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(".reloc"))
+    }
+
     /// Maps an RVA to an offset in the file, if it is backed by file data.
     pub fn rva_to_file_offset(&self, rva: u32) -> Option<u32> {
         self.sections.iter().find_map(|s| {

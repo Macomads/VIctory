@@ -263,12 +263,15 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             }
         );
     }
-    // Apply base relocations manually because the cached VIctory DLL has no
-    // BASERELOC data directory (index 5 is zero) even though it has a .reloc
-    // section and DIR64 entries. Wine's loader doesn't process relocations
-    // when the data directory is missing, so function pointers in .rdata
-    // remain at their preferred-base values. We must apply them here.
-    apply_relocations(module as usize, &prepared.info, &prepared.bytes)?;
+    // Apply base relocations manually for images that have a .reloc section
+    // but no BASERELOC data directory (e.g., the cached VIctory DLL). The
+    // Windows loader only processes relocations when the data directory is
+    // present; if it's missing but the section exists, relocations are not
+    // applied and function pointers in .rdata remain at their preferred-base
+    // values. We must apply them here.
+    if !prepared.info.has_relocations && prepared.info.has_reloc_section() {
+        apply_relocations(module as usize, &prepared.info, &prepared.bytes)?;
+    }
     let loaded = LoadedImage {
         module,
         path,
