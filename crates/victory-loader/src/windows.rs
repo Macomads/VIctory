@@ -7,12 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
-use victory_pe::layout::dir;
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect, VirtualQuery};
+use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
 const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
 const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
@@ -112,20 +111,15 @@ struct ImageNtHeaders64 {
 fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Result<()> {
     let delta = base.wrapping_sub(info.image_base as usize);
     if delta == 0 {
-        tracing::info!(base = format_args!("{:#x}"), preferred = format_args!("{:#x}"), "apply_relocations: delta is zero, skipping");
+        tracing::info!(base = format_args!("{:#x}", base), preferred = format_args!("{:#x}", info.image_base), "apply_relocations: delta is zero, skipping");
         return Ok(());
     }
     if !info.has_relocations {
-        tracing::info!(base = format_args!("{:#x}"), preferred = format_args!("{:#x}"), "apply_relocations: no relocations in image, skipping");
+        tracing::info!(base = format_args!("{:#x}", base), preferred = format_args!("{:#x}", info.image_base), "apply_relocations: no relocations in image, skipping");
         return Ok(());
     }
-    tracing::info!(base = format_args!("{:#x}"), preferred = format_args!("{:#x}"), delta = format_args!("{:#x}"), "apply_relocations: starting");
+    tracing::info!(base = format_args!("{:#x}", base), preferred = format_args!("{:#x}", info.image_base), delta = format_args!("{:#x}", delta), "apply_relocations: starting");
 
-    // Read the relocation directory from the prepared image's file bytes
-    let Some(reloc_dir_offset) = info.rva_to_file_offset(5 * 8) else {
-        tracing::warn!("apply_relocations: rva_to_file_offset(40) failed");
-        return Ok(());
-    };
     // The data directory for BASE_RELOC is at index 5 in the optional header's data directories
     // We need to find it via the optional header
     let dos_header = prepared_bytes.as_ptr() as *const ImageDosHeader;
@@ -146,17 +140,17 @@ fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Re
     let reloc_dir = unsafe { &*dirs_ptr.add(5) };
     let reloc_rva = reloc_dir.virtual_address;
     let reloc_size = reloc_dir.size;
-    tracing::info!(reloc_rva = format_args!("{:#x}"), reloc_size = format_args!("{:#x}"), "apply_relocations: found relocation directory");
+    tracing::info!(reloc_rva = format_args!("{:#x}", reloc_rva), reloc_size = format_args!("{:#x}", reloc_size), "apply_relocations: found relocation directory");
     if reloc_rva == 0 || reloc_size == 0 {
         tracing::warn!("apply_relocations: reloc_rva or reloc_size is zero");
         return Ok(());
     }
 
     let Some(reloc_file_offset) = info.rva_to_file_offset(reloc_rva) else {
-        tracing::warn!(reloc_rva = format_args!("{:#x}"), "apply_relocations: rva_to_file_offset failed for reloc_rva");
+        tracing::warn!(reloc_rva = format_args!("{:#x}", reloc_rva), "apply_relocations: rva_to_file_offset failed for reloc_rva");
         return Ok(());
     };
-    tracing::info!(reloc_file_offset = format_args!("{:#x}"), "apply_relocations: relocation table file offset");
+    tracing::info!(reloc_file_offset = format_args!("{:#x}", reloc_file_offset), "apply_relocations: relocation table file offset");
     let reloc_bytes = &prepared_bytes[reloc_file_offset as usize..][..reloc_size as usize];
     let image_size = info.size_of_image as usize;
 
@@ -198,12 +192,12 @@ fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Re
                     let mut ignored = 0;
                     unsafe { VirtualProtect(page_start as *mut c_void, 4096, target_old_protect, &mut ignored) };
                 } else {
-                    tracing::warn!(at = format_args!("{:#x}"), "apply_relocations: VirtualProtect failed");
+                    tracing::warn!(at = format_args!("{:#x}", at), "apply_relocations: VirtualProtect failed");
                 }
             }
         }
         if block_dir64 > 0 {
-            tracing::info!(block = blocks_parsed, page = format_args!("{:#x}"), block_size = format_args!("{:#x}"), entries = num_entries, dir64 = block_dir64, "apply_relocations: block parsed");
+            tracing::info!(block = blocks_parsed, page = format_args!("{:#x}", page), block_size = format_args!("{:#x}", block_size), entries = num_entries, dir64 = block_dir64, "apply_relocations: block parsed");
         }
         blocks_parsed += 1;
         cursor += block_size as usize;
@@ -268,8 +262,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             }
         );
     }
-    // Apply base relocations manually in case the host loader (Wine) missed any.
-    // This ensures DIR64 relocations in .rdata (e.g. function pointers) are correct.
+    // Apply base relocations manually because the cached VIctory DLL has no
+    // BASERELOC data directory (index 5 is zero) even though it has a .reloc
+    // section and DIR64 entries. Wine's loader doesn't process relocations
+    // when the data directory is missing, so function pointers in .rdata
+    // remain at their preferred-base values. We must apply them here.
     apply_relocations(module as usize, &prepared.info, &prepared.bytes)?;
     let loaded = LoadedImage {
         module,
