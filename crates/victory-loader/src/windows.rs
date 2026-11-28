@@ -22,6 +22,7 @@ use crate::{
     prepare,
 };
 
+#[allow(dead_code)]
 const REL_ABSOLUTE: u16 = 0;
 const REL_DIR64: u16 = 10;
 
