@@ -112,14 +112,18 @@ struct ImageNtHeaders64 {
 fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Result<()> {
     let delta = base.wrapping_sub(info.image_base as usize);
     if delta == 0 {
+        tracing::info!(base = format_args!("{:#x}"), preferred = format_args!("{:#x}"), "apply_relocations: delta is zero, skipping");
         return Ok(());
     }
     if !info.has_relocations {
+        tracing::info!(base = format_args!("{:#x}"), preferred = format_args!("{:#x}"), "apply_relocations: no relocations in image, skipping");
         return Ok(());
     }
+    tracing::info!(base = format_args!("{:#x}"), preferred = format_args!("{:#x}"), delta = format_args!("{:#x}"), "apply_relocations: starting");
 
     // Read the relocation directory from the prepared image's file bytes
     let Some(reloc_dir_offset) = info.rva_to_file_offset(5 * 8) else {
+        tracing::warn!("apply_relocations: rva_to_file_offset(40) failed");
         return Ok(());
     };
     // The data directory for BASE_RELOC is at index 5 in the optional header's data directories
@@ -134,6 +138,7 @@ fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Re
     }
     let optional_header = unsafe { &(*nt_headers_ptr).optional_header };
     if optional_header.number_of_rva_and_sizes <= 5 {
+        tracing::warn!("apply_relocations: number_of_rva_and_sizes <= 5");
         return Ok(());
     }
     let dirs_ptr = (optional_header as *const ImageOptionalHeader64 as usize +
@@ -141,25 +146,33 @@ fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Re
     let reloc_dir = unsafe { &*dirs_ptr.add(5) };
     let reloc_rva = reloc_dir.virtual_address;
     let reloc_size = reloc_dir.size;
+    tracing::info!(reloc_rva = format_args!("{:#x}"), reloc_size = format_args!("{:#x}"), "apply_relocations: found relocation directory");
     if reloc_rva == 0 || reloc_size == 0 {
+        tracing::warn!("apply_relocations: reloc_rva or reloc_size is zero");
         return Ok(());
     }
 
     let Some(reloc_file_offset) = info.rva_to_file_offset(reloc_rva) else {
+        tracing::warn!(reloc_rva = format_args!("{:#x}"), "apply_relocations: rva_to_file_offset failed for reloc_rva");
         return Ok(());
     };
+    tracing::info!(reloc_file_offset = format_args!("{:#x}"), "apply_relocations: relocation table file offset");
     let reloc_bytes = &prepared_bytes[reloc_file_offset as usize..][..reloc_size as usize];
     let image_size = info.size_of_image as usize;
 
     let mut cursor = 0;
+    let mut blocks_parsed = 0;
+    let mut dir64_applied = 0;
     while cursor + 8 <= reloc_bytes.len() {
         let page = u32::from_le_bytes([reloc_bytes[cursor], reloc_bytes[cursor+1], reloc_bytes[cursor+2], reloc_bytes[cursor+3]]);
         let block_size = u32::from_le_bytes([reloc_bytes[cursor+4], reloc_bytes[cursor+5], reloc_bytes[cursor+6], reloc_bytes[cursor+7]]);
         if block_size < 8 || cursor + block_size as usize > reloc_bytes.len() {
+            tracing::warn!(cursor = cursor, block_size = block_size, "apply_relocations: invalid block, stopping");
             break;
         }
         let entries_start = cursor + 8;
         let num_entries = (block_size as usize - 8) / 2;
+        let mut block_dir64 = 0;
         for i in 0..num_entries {
             let entry_offset = entries_start + i * 2;
             if entry_offset + 2 > reloc_bytes.len() {
@@ -169,6 +182,7 @@ fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Re
             let kind = entry >> 12;
             let offset = (entry & 0x0fff) as usize;
             if kind == REL_DIR64 {
+                block_dir64 += 1;
                 let at = page as usize + offset;
                 if at + 8 > image_size {
                     continue;
@@ -180,13 +194,21 @@ fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Re
                 let ok = unsafe { VirtualProtect(page_start as *mut c_void, 4096, PAGE_READWRITE, &mut target_old_protect) };
                 if ok != 0 {
                     unsafe { slot.write_unaligned(slot.read_unaligned().wrapping_add(delta as u64)) };
+                    dir64_applied += 1;
                     let mut ignored = 0;
                     unsafe { VirtualProtect(page_start as *mut c_void, 4096, target_old_protect, &mut ignored) };
+                } else {
+                    tracing::warn!(at = format_args!("{:#x}"), "apply_relocations: VirtualProtect failed");
                 }
             }
         }
+        if block_dir64 > 0 {
+            tracing::info!(block = blocks_parsed, page = format_args!("{:#x}"), block_size = format_args!("{:#x}"), entries = num_entries, dir64 = block_dir64, "apply_relocations: block parsed");
+        }
+        blocks_parsed += 1;
         cursor += block_size as usize;
     }
+    tracing::info!(blocks_parsed = blocks_parsed, dir64_applied = dir64_applied, "apply_relocations: done");
 
     Ok(())
 }
