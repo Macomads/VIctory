@@ -37,6 +37,13 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         ((base + tls.directory_rva as usize + TLS64_ADDRESS_OF_INDEX) as *const usize).read()
     } as *mut u32;
     // SAFETY: as above.
+    // Validate index_at is within the image bounds (guard against Wine loader bugs)
+    let index_at_addr = index_at as usize;
+    if index_at_addr < base || index_at_addr >= base + info.size_of_image as usize {
+        // TLS index pointer is invalid (likely Wine didn't initialize it properly);
+        // assume index 0 and skip redirection.
+        return Ok(0);
+    }
     let index = unsafe { index_at.read() };
     if index == 0 {
         return Ok(0);

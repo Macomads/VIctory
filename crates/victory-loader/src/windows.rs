@@ -7,17 +7,189 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use victory_pe::{ImageInfo, ImportSymbol};
+use victory_pe::layout::dir;
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect, VirtualQuery};
+
+const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
+const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
     prepare,
 };
+
+const REL_ABSOLUTE: u16 = 0;
+const REL_DIR64: u16 = 10;
+
+#[repr(C)]
+struct ImageDosHeader {
+    e_magic: u16,
+    e_cblp: u16,
+    e_cp: u16,
+    e_crlc: u16,
+    e_cparhdr: u16,
+    e_minalloc: u16,
+    e_maxalloc: u16,
+    e_ss: u16,
+    e_sp: u16,
+    e_csum: u16,
+    e_ip: u16,
+    e_cs: u16,
+    e_lfarlc: u16,
+    e_ovno: u16,
+    e_res: [u16; 4],
+    e_oemid: u16,
+    e_oeminfo: u16,
+    e_res2: [u16; 10],
+    e_lfanew: i32,
+}
+
+#[repr(C)]
+struct ImageFileHeader {
+    machine: u16,
+    number_of_sections: u16,
+    time_date_stamp: u32,
+    pointer_to_symbol_table: u32,
+    number_of_symbols: u32,
+    size_of_optional_header: u16,
+    characteristics: u16,
+}
+
+#[repr(C)]
+struct ImageOptionalHeader64 {
+    magic: u16,
+    major_linker_version: u8,
+    minor_linker_version: u8,
+    size_of_code: u32,
+    size_of_initialized_data: u32,
+    size_of_uninitialized_data: u32,
+    address_of_entry_point: u32,
+    base_of_code: u32,
+    image_base: u64,
+    section_alignment: u32,
+    file_alignment: u32,
+    major_os_version: u16,
+    minor_os_version: u16,
+    major_image_version: u16,
+    minor_image_version: u16,
+    major_subsystem_version: u16,
+    minor_subsystem_version: u16,
+    win32_version_value: u32,
+    size_of_image: u32,
+    size_of_headers: u32,
+    check_sum: u32,
+    subsystem: u16,
+    dll_characteristics: u16,
+    size_of_stack_reserve: u64,
+    size_of_stack_commit: u64,
+    size_of_heap_reserve: u64,
+    size_of_heap_commit: u64,
+    loader_flags: u32,
+    number_of_rva_and_sizes: u32,
+    // Data directories follow
+}
+
+#[repr(C)]
+struct ImageDataDirectory {
+    virtual_address: u32,
+    size: u32,
+}
+
+#[repr(C)]
+struct ImageNtHeaders64 {
+    signature: u32,
+    file_header: ImageFileHeader,
+    optional_header: ImageOptionalHeader64,
+}
+
+/// Apply base relocations using the prepared image's file bytes (not the loaded module's memory,
+/// which the Windows loader zeroes after applying relocations).
+fn apply_relocations(base: usize, info: &ImageInfo, prepared_bytes: &[u8]) -> Result<()> {
+    let delta = base.wrapping_sub(info.image_base as usize);
+    if delta == 0 {
+        return Ok(());
+    }
+    if !info.has_relocations {
+        return Ok(());
+    }
+
+    // Read the relocation directory from the prepared image's file bytes
+    let Some(reloc_dir_offset) = info.rva_to_file_offset(5 * 8) else {
+        return Ok(());
+    };
+    // The data directory for BASE_RELOC is at index 5 in the optional header's data directories
+    // We need to find it via the optional header
+    let dos_header = prepared_bytes.as_ptr() as *const ImageDosHeader;
+    if unsafe { (*dos_header).e_magic } != IMAGE_DOS_SIGNATURE {
+        bail!("Invalid DOS signature in prepared image");
+    }
+    let nt_headers_ptr = (prepared_bytes.as_ptr() as usize + unsafe { (*dos_header).e_lfanew } as usize) as *const ImageNtHeaders64;
+    if unsafe { (*nt_headers_ptr).signature } != IMAGE_NT_SIGNATURE {
+        bail!("Invalid NT signature in prepared image");
+    }
+    let optional_header = unsafe { &(*nt_headers_ptr).optional_header };
+    if optional_header.number_of_rva_and_sizes <= 5 {
+        return Ok(());
+    }
+    let dirs_ptr = (optional_header as *const ImageOptionalHeader64 as usize +
+        std::mem::size_of::<ImageOptionalHeader64>()) as *const ImageDataDirectory;
+    let reloc_dir = unsafe { &*dirs_ptr.add(5) };
+    let reloc_rva = reloc_dir.virtual_address;
+    let reloc_size = reloc_dir.size;
+    if reloc_rva == 0 || reloc_size == 0 {
+        return Ok(());
+    }
+
+    let Some(reloc_file_offset) = info.rva_to_file_offset(reloc_rva) else {
+        return Ok(());
+    };
+    let reloc_bytes = &prepared_bytes[reloc_file_offset as usize..][..reloc_size as usize];
+    let image_size = info.size_of_image as usize;
+
+    let mut cursor = 0;
+    while cursor + 8 <= reloc_bytes.len() {
+        let page = u32::from_le_bytes([reloc_bytes[cursor], reloc_bytes[cursor+1], reloc_bytes[cursor+2], reloc_bytes[cursor+3]]);
+        let block_size = u32::from_le_bytes([reloc_bytes[cursor+4], reloc_bytes[cursor+5], reloc_bytes[cursor+6], reloc_bytes[cursor+7]]);
+        if block_size < 8 || cursor + block_size as usize > reloc_bytes.len() {
+            break;
+        }
+        let entries_start = cursor + 8;
+        let num_entries = (block_size as usize - 8) / 2;
+        for i in 0..num_entries {
+            let entry_offset = entries_start + i * 2;
+            if entry_offset + 2 > reloc_bytes.len() {
+                break;
+            }
+            let entry = u16::from_le_bytes([reloc_bytes[entry_offset], reloc_bytes[entry_offset+1]]);
+            let kind = entry >> 12;
+            let offset = (entry & 0x0fff) as usize;
+            if kind == REL_DIR64 {
+                let at = page as usize + offset;
+                if at + 8 > image_size {
+                    continue;
+                }
+                let slot = (base + at) as *mut u64;
+                // Make the target page writable before writing
+                let page_start = (base + at) & !0xfff;
+                let mut target_old_protect = 0;
+                let ok = unsafe { VirtualProtect(page_start as *mut c_void, 4096, PAGE_READWRITE, &mut target_old_protect) };
+                if ok != 0 {
+                    unsafe { slot.write_unaligned(slot.read_unaligned().wrapping_add(delta as u64)) };
+                    let mut ignored = 0;
+                    unsafe { VirtualProtect(page_start as *mut c_void, 4096, target_old_protect, &mut ignored) };
+                }
+            }
+        }
+        cursor += block_size as usize;
+    }
+
+    Ok(())
+}
 
 /// A title image mapped into this process. A clone names the same mapping
 /// (no reference of its own): unload one copy only.
@@ -74,6 +246,9 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             }
         );
     }
+    // Apply base relocations manually in case the host loader (Wine) missed any.
+    // This ensures DIR64 relocations in .rdata (e.g. function pointers) are correct.
+    apply_relocations(module as usize, &prepared.info, &prepared.bytes)?;
     let loaded = LoadedImage {
         module,
         path,
