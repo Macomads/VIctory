@@ -35,8 +35,10 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
 pub mod list;
 pub mod object;
+#[cfg(windows)]
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
